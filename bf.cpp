@@ -1,273 +1,225 @@
+#include <cstdint>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/stat.h>
-/*
-** A closure-based BrainFuck intepreter.
-** Inspired by
-*https://planetscale.com/blog/faster-interpreters-in-go-catching-up-with-cpp
-**
-** and https://github.com/skx/closure-based-brainfuck-vm.
-**
-** Compiles the input program into a series of closures.
-*/
-#define ERROR(msg)                                                             \
-    do {                                                                       \
-        fprintf(stderr, "Error: %s\n", msg);                                   \
-    } while (0)
+#include <string>
+#include <vector>
 
-long get_file_size_cross_platform(const char *filename) {
-    struct stat st;
+#define CELL_SIZE uint8_t // could do 16 bit?
 
-#ifdef _WIN32
-    if (_stat(filename, &st) == 0) {
-#else
-    if (stat(filename, &st) == 0) {
-#endif
-        return st.st_size;
-    }
-    return -1;
-}
-
-char *read_entire_file(const char *filename) {
-    FILE *fp = fopen(filename, "rb"); // Binary mode for exact byte count
-    if (fp == NULL) {
-        perror("Failed to open file");
-        return NULL;
-    }
-
-    // Get file size
-    fseek(fp, 0, SEEK_END);
-    long size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    if (size == -1) {
-        perror("Failed to get file size");
-        fclose(fp);
-        return NULL;
-    }
-
-    // Allocate buffer (+1 for null terminator)
-    char *buffer = (char *)malloc(size + 1);
-    if (buffer == NULL) {
-        perror("Failed to allocate memory");
-        fclose(fp);
-        return NULL;
-    }
-
-    // Read entire file
-    size_t bytes_read = fread(buffer, 1, size, fp);
-    fclose(fp);
-
-    if (bytes_read != (size_t)size) {
-        fprintf(stderr, "Failed to read entire file\n");
-        free(buffer);
-        return NULL;
-    }
-
-    // Null-terminate the string
-    buffer[size] = '\0';
-
-    return buffer;
-}
+struct RunLengthResult {
+    int count;
+    int new_index;
+};
 
 struct vm;
 
-typedef std::function<void(struct vm *)> func;
-typedef struct vm {
-    int ip;            // instruction pointer
-    int ptr;           // data pointer
-    int memory[30000]; // only use 8 bits
-    std::vector<func> fns;
-    vm() : ip(0), ptr(0), memory{}, fns() {}
-} vm;
+using Op = std::function<void(vm *)>;
 
-struct rpt {
-    int count;
-    int i;
+struct vm {
+    unsigned int ip = 0;           // Instruction pointer
+    unsigned int ptr = 0;          // Data pointer
+    std::vector<CELL_SIZE> memory; // VM memory, using a vector of bytes
+    std::vector<Op> ops;           // Compiled operations
+    bool halted = false;
+
+    vm() : memory(30000, 0) {} // Initialize memory to 30,000 zeroed bytes
 };
 
-func vm_exit() {
-    return [](vm *VM) { throw std::runtime_error("DONE"); };
+Op vm_exit() {
+    return [](vm *v) { v->halted = true; };
 }
 
-func inc(int n) {
-    return [n](vm *VM) {
-        VM->memory[VM->ptr] += n;
-        VM->memory[VM->ptr] &= 0xFF;
-        ++VM->ip;
+Op inc(int n) {
+    return [n](vm *v) {
+        v->memory[v->ptr] += n;
+        ++v->ip;
     };
 }
 
-func dec(int n) {
-    return [n](vm *VM) {
-        VM->memory[VM->ptr] -= n;
-        VM->memory[VM->ptr] &= 0xFF;
-        ++VM->ip;
+Op dec(int n) {
+    return [n](vm *v) {
+        v->memory[v->ptr] -= n;
+        ++v->ip;
     };
 }
 
-func ptr_inc(int n) {
-    return [n](vm *VM) {
-        VM->ptr += n;
-        ++VM->ip;
-    };
-}
-
-func ptr_dec(int n) {
-    return [n](vm *VM) {
-        VM->ptr -= n;
-        ++VM->ip;
-    };
-}
-
-func vm_read() {
-    return [](vm *VM) {
-        int res;
-        if ((res = scanf("%d", &(VM->memory[VM->ptr]))) < 0)
-            exit(1);
-        VM->memory[VM->ptr] &= 0xFF;
-        ++VM->ip;
-    };
-}
-
-func vm_write() {
-    return [](vm *VM) {
-        printf("%c", VM->memory[VM->ptr]);
-        ++VM->ip;
-    };
-}
-
-func vm_loop_start(int offset) {
-    return [offset](vm *VM) {
-        if (VM->memory[VM->ptr] != 0x00) {
-            ++VM->ip;
-            return;
+Op ptr_inc(int n) {
+    return [n](vm *v) {
+        v->ptr += n;
+        // TODO: Add bounds checking for the pointer ???
+        if (v->ptr >= v->memory.size()) {
+            // For this simple interpreter, let it wrap or expand memory.
+            // Could also throw an error for robustness.
         }
-        VM->ip = offset;
+        ++v->ip;
     };
 }
 
-func noop() {
-    return [](vm *VM) {};
+Op ptr_dec(int n) {
+    return [n](vm *v) {
+        v->ptr -= n;
+        ++v->ip;
+    };
 }
 
-func vm_loop_end(int offset) {
-    return [offset](vm *VM) {
-        if (VM->memory[VM->ptr] == 0x00) {
-            ++VM->ip;
-            return;
+Op vm_read() {
+    return [](vm *v) {
+        char input;
+        if (std::cin.get(input)) {
+            v->memory[v->ptr] = static_cast<CELL_SIZE>(input);
+        } else {
+            v->memory[v->ptr] = 0; // Default on EOF
         }
-        VM->ip = offset;
+        ++v->ip;
     };
 }
 
-struct rpt findMultiple(char *content, int sz, int start, char c) {
+Op vm_write() {
+    return [](vm *v) {
+        std::cout << static_cast<char>(v->memory[v->ptr]);
+        ++v->ip;
+    };
+}
+
+Op vm_loop_start(int jump_target) {
+    return [jump_target](vm *v) {
+        if (v->memory[v->ptr] == 0) {
+            v->ip = jump_target;
+        } else {
+            ++v->ip;
+        }
+    };
+}
+
+Op vm_loop_end(int jump_target) {
+    return [jump_target](vm *v) {
+        if (v->memory[v->ptr] != 0) {
+            v->ip = jump_target;
+        } else {
+            ++v->ip;
+        }
+    };
+}
+
+// A placeholder for '[' until we know the matching ']' location
+Op noop() {
+    return [](vm *v) {
+        // This should ideally never be called.
+        throw std::logic_error("Unmatched '[' was executed.");
+    };
+}
+
+// make this more like C++
+std::string read_file_content(const char *filename) {
+    std::ifstream file(filename);
+    if (!file) {
+        throw std::runtime_error("Failed to open file");
+    }
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
+}
+
+RunLengthResult find_multiple(const std::string &content, int start, char c) {
     int k = start;
-    while (k < sz) {
-        if (content[k] != c) {
-            break;
-        }
+    while (k < content.length() && content[k] == c) {
         k++;
     }
-    return {.count = (k - start), .i = k};
-};
+    return {k - start, k};
+}
 
-int main(const int argc, const char **argv) {
-
+int main(int argc, char **argv) {
     if (argc < 2) {
-        ERROR("Expected argument: file");
+        std::cerr << "Error: Expected argument: file" << std::endl;
         return 1;
     }
 
-    FILE *fp = fopen(argv[1], "r");
-    if (fp == NULL) {
-        ERROR("Could not find file");
-        exit(1);
-    }
-
-    int i = 0;
-    long sz = get_file_size_cross_platform(argv[1]);
-    if (sz < 1) {
-
-        ERROR("Invalid BrainFuck program.");
-        exit(1);
-    }
-
-    char *content = read_entire_file(argv[1]);
-    if (content == NULL) {
-        ERROR("Failed to read file");
-        exit(1);
-    }
-    vm prog;
-    char c;
-
-    // Compile
-    std::vector<int> loop_stack;
-    struct rpt r;
-    while (i < sz) {
-        c = content[i];
-        if (c == '\0')
-            break;
-        switch (c) {
-        case '+':
-            r = findMultiple(content, sz, i, '+');
-            prog.fns.push_back(inc(r.count));
-            i = r.i;
-            break;
-        case '-':
-            r = findMultiple(content, sz, i, '-');
-            prog.fns.push_back(dec(r.count));
-            i = r.i;
-            break;
-        case '>':
-            r = findMultiple(content, sz, i, '>');
-            prog.fns.push_back(ptr_inc(r.count));
-            i = r.i;
-            break;
-        case '<':
-            r = findMultiple(content, sz, i, '<');
-            prog.fns.push_back(ptr_dec(r.count));
-            i = r.i;
-            break;
-        case ',':
-            prog.fns.push_back(vm_read());
-            ++i;
-            break;
-        case '.':
-            prog.fns.push_back(vm_write());
-            ++i;
-            break;
-        case '[':
-            loop_stack.push_back(prog.fns.size());
-            prog.fns.push_back(noop());
-            i++;
-            break;
-        case ']': {
-            int loop = loop_stack.back();
-            loop_stack.pop_back();
-            prog.fns[loop] = vm_loop_start(prog.fns.size());
-            prog.fns.push_back(vm_loop_end(loop));
-            i++;
-            break;
+    try {
+        const std::string content = read_file_content(argv[1]);
+        if (content.empty()) {
+            std::cerr
+                << "Error: BrainFuck program is empty or could not be read."
+                << std::endl;
+            return 1;
         }
-        default:
-            i++;
-            break;
-        }
-    }
-    prog.fns.push_back(vm_exit());
-    fclose(fp);
-    free(content);
 
-    // Execute
-    while (1) {
-        try {
-            prog.fns[prog.ip](&prog);
-        } catch (const std::exception &e) {
-            return 0;
+        vm prog;
+        std::vector<int> loop_stack;
+
+        // Compile
+        int i = 0;
+        while (i < content.length()) {
+            RunLengthResult r;
+            switch (content[i]) {
+            case '+':
+                r = find_multiple(content, i, '+');
+                prog.ops.push_back(inc(r.count));
+                i = r.new_index;
+                break;
+            case '-':
+                r = find_multiple(content, i, '-');
+                prog.ops.push_back(dec(r.count));
+                i = r.new_index;
+                break;
+            case '>':
+                r = find_multiple(content, i, '>');
+                prog.ops.push_back(ptr_inc(r.count));
+                i = r.new_index;
+                break;
+            case '<':
+                r = find_multiple(content, i, '<');
+                prog.ops.push_back(ptr_dec(r.count));
+                i = r.new_index;
+                break;
+            case ',':
+                prog.ops.push_back(vm_read());
+                ++i;
+                break;
+            case '.':
+                prog.ops.push_back(vm_write());
+                ++i;
+                break;
+            case '[':
+                loop_stack.push_back(prog.ops.size());
+                prog.ops.push_back(noop()); // Placeholder
+                i++;
+                break;
+            case ']': {
+                if (loop_stack.empty()) {
+                    throw std::runtime_error("Mismatched ']'");
+                }
+                int loop_start_ip = loop_stack.back();
+                loop_stack.pop_back();
+                int loop_end_ip = prog.ops.size();
+                prog.ops[loop_start_ip] = vm_loop_start(loop_end_ip + 1);
+                prog.ops.push_back(vm_loop_end(loop_start_ip + 1));
+                i++;
+                break;
+            }
+            default:
+                i++; // Ignore other characters
+                break;
+            }
         }
+
+        if (!loop_stack.empty()) {
+            throw std::runtime_error("Mismatched '['");
+        }
+
+        prog.ops.push_back(vm_exit());
+
+        // Execute
+        while (!prog.halted) {
+            prog.ops[prog.ip](&prog);
+        }
+
+    } catch (const std::exception &e) {
+        std::cerr << "Runtime Error: " << e.what() << std::endl;
+        return 1;
     }
+
+    return 0;
 }
